@@ -433,11 +433,15 @@ class _AgentWorker(QThread):
             )
 
             if self._tool._prefs.use_copilot:
+                # Pre-fetch session info so the model doesn't waste a
+                # round trip calling get_session_info.
+                session_info = get_info()
                 reply = agent_mod.run_agent_copilot(
                     self._tool.session,
                     self._tool._api_messages,
                     self._tool._prefs,
                     callbacks,
+                    session_info=session_info,
                 )
             else:
                 reply = agent_mod.run_agent(

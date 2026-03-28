@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 from chimerallm.system_prompt import SYSTEM_PROMPT
@@ -320,13 +321,43 @@ def fetch_copilot_models() -> List[str]:
         return _COPILOT_MODELS_FALLBACK
 
 
+_COPILOT_CMD_INSTRUCTIONS = """
+
+## Command output format
+You do NOT have function-calling tools. Instead, output ChimeraX commands inside a
+single XML tag in your response:
+
+<chimerax>command1; command2; command3</chimerax>
+
+Rules:
+- Put ALL commands in ONE <chimerax> tag, separated by semicolons.
+- Only use ONE <chimerax> tag per response.
+- Commands are executed automatically after your response. You will NOT see their output.
+- Write your explanation as normal text outside the tag.
+- If session state is provided above, use it directly — do not ask for it.
+- Plan your full command sequence carefully and get it right the first time.
+"""
+
+_CHIMERAX_CMD_RE = re.compile(r"<chimerax>(.*?)</chimerax>", re.DOTALL)
+
+
 def run_agent_copilot(
     session,
     api_messages: List[Dict[str, Any]],
     settings,
     callbacks: AgentCallbacks,
+    session_info: str = "",
 ) -> str:
-    """Run one assistant turn via the GitHub Copilot API (native tool calling)."""
+    """Run one assistant turn via the GitHub Copilot API (single-shot, 1 request).
+
+    Instead of native tool calling (which forces multi-round-trip), the model
+    outputs ChimeraX commands inline in ``<chimerax>`` tags.  We parse and
+    execute them after receiving the single response.  This ensures exactly
+    **one API request per user prompt**, matching Copilot's request-based billing.
+
+    *session_info* is pre-fetched session state injected into the system prompt
+    so the model already knows what is loaded.
+    """
     try:
         from openai import OpenAI
     except ImportError as e:
@@ -349,91 +380,17 @@ def run_agent_copilot(
     )
 
     model = getattr(settings, "copilot_model", "gpt-4o") or "gpt-4o"
-    max_iterations = int(getattr(settings, "max_iterations", 10))
+
+    sys_content = SYSTEM_PROMPT + _COPILOT_CMD_INSTRUCTIONS
+    if session_info:
+        sys_content += "\n## Current session state (auto-provided)\n" + session_info
 
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": sys_content},
         *api_messages,
     ]
 
-    final_text = ""
-
-    for iteration in range(max_iterations):
-        if callbacks.on_iteration:
-            callbacks.on_iteration(iteration)
-
-        _log_llm_request(
-            session,
-            model=model,
-            via_copilot=True,
-            this_call_chars=_messages_context_chars(messages),
-        )
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
-
-        msg = response.choices[0].message
-
-        if msg.content:
-            final_text = msg.content
-            if callbacks.on_assistant_delta:
-                callbacks.on_assistant_delta(msg.content)
-
-        if not msg.tool_calls:
-            messages.append({"role": "assistant", "content": msg.content})
-            _sync_api_messages(api_messages, messages)
-            return msg.content or final_text or ""
-
-        assistant_msg: Dict[str, Any] = {"role": "assistant", "content": msg.content}
-        assistant_msg["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments or "{}",
-                },
-            }
-            for tc in msg.tool_calls
-        ]
-        messages.append(assistant_msg)
-
-        for tc in msg.tool_calls:
-            fname = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                result = "Error: invalid JSON in tool arguments"
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-                continue
-
-            try:
-                if fname == "execute_chimerax_command":
-                    cmd = args.get("command", "")
-                    result = callbacks.execute_chimerax_command(cmd)
-                elif fname == "get_session_info":
-                    result = callbacks.get_session_info()
-                elif fname == "log_message":
-                    callbacks.log_message(args.get("message", ""))
-                    result = "Message shown to user."
-                else:
-                    result = f"Unknown tool {fname}"
-            except Exception as e:
-                result = f"Error executing tool {fname}: {e}"
-
-            messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": result[:8000]}
-            )
-
-    messages.append(
-        {
-            "role": "user",
-            "content": "Stop calling tools. Briefly summarize what was done and what may still be needed.",
-        }
-    )
+    # --- Single API request, no tools parameter ---
     _log_llm_request(
         session,
         model=model,
@@ -444,8 +401,21 @@ def run_agent_copilot(
         model=model,
         messages=messages,
     )
+
     text = response.choices[0].message.content or ""
-    messages.append({"role": "assistant", "content": text})
-    final_text = text
-    _sync_api_messages(api_messages, messages)
-    return final_text
+
+    # Extract and execute commands from <chimerax> tags
+    for m in _CHIMERAX_CMD_RE.finditer(text):
+        cmd_block = m.group(1).strip()
+        for cmd in cmd_block.split(";"):
+            cmd = cmd.strip()
+            if cmd:
+                callbacks.execute_chimerax_command(cmd)
+
+    # Clean response for display (remove <chimerax> tags)
+    clean_text = _CHIMERAX_CMD_RE.sub("", text).strip()
+
+    # Save full response (with command tags) to conversation history
+    api_messages.append({"role": "assistant", "content": text})
+
+    return clean_text or "(commands executed)"
