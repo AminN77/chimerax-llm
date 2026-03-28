@@ -6,12 +6,13 @@ import threading
 import html
 
 from Qt.QtCore import QObject, Qt, QThread, Signal
-from Qt.QtGui import QTextCursor  # noqa: F401 – used by _append_html if needed later
+from Qt.QtGui import QKeySequence, QShortcut
 from Qt.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
     QTextEdit,
+    QPlainTextEdit,
     QLineEdit,
     QPushButton,
     QDialog,
@@ -73,7 +74,7 @@ class ChimeraLLMTool(ToolInstance):
         text = (text or "").strip()
         if not text:
             return
-        self.input_line.setText(text)
+        self.prompt_input.setPlainText(text)
         self._send_message()
 
     def _build_ui(self):
@@ -100,14 +101,24 @@ class ChimeraLLMTool(ToolInstance):
         layout.addWidget(self.chat_view, stretch=1)
 
         row = QHBoxLayout()
-        self.input_line = QLineEdit()
-        self.input_line.setPlaceholderText("Describe what you want in ChimeraX…")
-        self.input_line.returnPressed.connect(self._send_message)
-        row.addWidget(self.input_line, stretch=1)
+        self.prompt_input = QPlainTextEdit()
+        self.prompt_input.setMinimumHeight(120)
+        self.prompt_input.setPlaceholderText(
+            "Describe what you want in ChimeraX…\n"
+            "(Enter for a new line — Ctrl+Enter or the Send button to submit)"
+        )
+        self.prompt_input.setTabChangesFocus(False)
+        row.addWidget(self.prompt_input, stretch=1)
         send_btn = QPushButton("Send")
+        send_btn.setToolTip("Send prompt (same as Ctrl+Enter)")
         send_btn.clicked.connect(self._send_message)
-        row.addWidget(send_btn)
+        row.addWidget(send_btn, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(row)
+
+        for seq in ("Ctrl+Return", "Ctrl+Enter"):
+            sc = QShortcut(QKeySequence(seq), self.prompt_input)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(self._send_message)
 
         self._append_html(
             "<p><i>Enter an API key in Settings. Commands run by the agent appear below.</i></p>"
@@ -183,13 +194,13 @@ class ChimeraLLMTool(ToolInstance):
         return result_holder[0] if result_holder[0] is not None else "(no result)"
 
     def _send_message(self):
-        text = self.input_line.text().strip()
+        text = self.prompt_input.toPlainText().strip()
         if not text:
             return
         if self._agent_worker is not None and self._agent_worker.isRunning():
             self.session.logger.warning("ChimeraLLM is still working on the previous message.")
             return
-        self.input_line.clear()
+        self.prompt_input.clear()
         self._append_html(self._fmt_user(text))
 
         self._agent_worker = _AgentWorker(self, text)
