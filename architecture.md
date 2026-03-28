@@ -67,10 +67,19 @@ User prompt (natural language)
 ### 2. GitHub Copilot (`run_agent_copilot`)
 
 - Uses the `openai` Python SDK pointed at `https://api.githubcopilot.com`
-- Same native tool-calling protocol as the API backend (no text-based workarounds)
+- Same native tool-calling protocol as the API backend
 - Authenticates with a GitHub OAuth token obtained via device flow
 - Token is read from `~/.local/share/opencode/auth.json` (shared with opencode) or obtained via the built-in "Login with GitHub" button
-- Copilot billing: uses your GitHub Copilot subscription's premium request allowance
+- Session info is pre-fetched and injected into the system prompt so the model already knows what is loaded (avoids a wasted `get_session_info` round trip)
+
+#### Copilot billing: `x-initiator` header
+
+Copilot bills per premium request, not per token. To keep the agentic loop without burning quota, the backend uses the `x-initiator` header (same approach as [opencode](https://github.com/sst/opencode)):
+
+- **First request** in each turn: `x-initiator: user` — billed as one premium request
+- **Follow-up requests** (carrying tool results back to the model): `x-initiator: agent` — not counted against the premium quota
+
+This means a single user prompt costs exactly **one premium request** regardless of how many tool-calling rounds the agent takes.
 
 ### Copilot authentication flow
 

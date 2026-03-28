@@ -55,7 +55,7 @@ Open the **ChimeraLLM** tool, click **Settings**, and configure one of the two b
 
 ### Option B: GitHub Copilot
 
-Check **"Use GitHub Copilot instead of API"** in Settings. This calls the Copilot API directly using native OpenAI-style tool calling — no API key or separate billing needed.
+Check **"Use GitHub Copilot instead of API"** in Settings. This calls the Copilot API directly with native tool calling — no API key or separate billing needed. Each user prompt costs exactly **one premium request** regardless of how many tool-calling rounds the agent takes (follow-up rounds are tagged `x-initiator: agent` and are not billed, matching the approach used by [opencode](https://github.com/sst/opencode)).
 
 | Setting | Description |
 |---|---|
