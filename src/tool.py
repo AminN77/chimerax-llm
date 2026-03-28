@@ -19,6 +19,9 @@ from Qt.QtWidgets import (
     QDoubleSpinBox,
     QSpinBox,
     QToolButton,
+    QCheckBox,
+    QComboBox,
+    QGroupBox,
 )
 
 from chimerax.core.tools import ToolInstance
@@ -211,25 +214,78 @@ class ChimeraLLMTool(ToolInstance):
         dlg.setWindowTitle("ChimeraLLM Settings")
         form = QFormLayout(dlg)
 
+        # --- opencode section ---
+        oc_group = QGroupBox("opencode (GitHub Copilot / local models)")
+        oc_layout = QFormLayout(oc_group)
+
+        oc_check = QCheckBox("Use opencode instead of API")
+        oc_check.setChecked(bool(self._settings.use_opencode))
+        oc_layout.addRow(oc_check)
+
+        oc_model_combo = QComboBox()
+        oc_model_combo.setEditable(True)
+        oc_model_combo.setMinimumWidth(300)
+        # Populate with models from opencode CLI
+        saved_oc_model = self._settings.opencode_model or "github-copilot/claude-sonnet-4"
+        oc_model_combo.addItem(saved_oc_model)
+        oc_model_combo.setCurrentText(saved_oc_model)
+        oc_layout.addRow("opencode model:", oc_model_combo)
+
+        oc_refresh_btn = QPushButton("Refresh models")
+        oc_layout.addRow(oc_refresh_btn)
+
+        def _refresh_models():
+            oc_model_combo.clear()
+            models = agent_mod.fetch_opencode_models()
+            if models:
+                oc_model_combo.addItems(models)
+                if saved_oc_model in models:
+                    oc_model_combo.setCurrentText(saved_oc_model)
+            else:
+                oc_model_combo.addItem("(could not fetch models)")
+
+        oc_refresh_btn.clicked.connect(_refresh_models)
+
+        form.addRow(oc_group)
+
+        # --- API section ---
+        api_group = QGroupBox("OpenAI-compatible API")
+        api_layout = QFormLayout(api_group)
+
+        url_edit = QLineEdit()
+        url_edit.setText(self._settings.api_base_url or "")
+        url_edit.setPlaceholderText("https://openrouter.ai/api/v1")
+        api_layout.addRow("API endpoint URL:", url_edit)
+
         key_edit = QLineEdit()
         key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         key_edit.setText(self._settings.api_key or "")
-        form.addRow("API key (OpenAI-compatible):", key_edit)
+        api_layout.addRow("API key:", key_edit)
 
         model_edit = QLineEdit()
         model_edit.setText(self._settings.model or "gpt-4o")
-        form.addRow("Model:", model_edit)
+        api_layout.addRow("Model:", model_edit)
 
         temp = QDoubleSpinBox()
         temp.setRange(0.0, 2.0)
         temp.setSingleStep(0.1)
         temp.setValue(float(self._settings.temperature))
-        form.addRow("Temperature:", temp)
+        api_layout.addRow("Temperature:", temp)
 
+        form.addRow(api_group)
+
+        # --- Shared settings ---
         iters = QSpinBox()
         iters.setRange(1, 50)
         iters.setValue(int(self._settings.max_iterations))
-        form.addRow("Max API rounds:", iters)
+        form.addRow("Max iterations:", iters)
+
+        # Toggle API group enabled based on opencode checkbox
+        def _toggle_api_group(checked):
+            api_group.setEnabled(not checked)
+
+        oc_check.toggled.connect(_toggle_api_group)
+        _toggle_api_group(oc_check.isChecked())
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -241,6 +297,9 @@ class ChimeraLLMTool(ToolInstance):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        self._settings.use_opencode = oc_check.isChecked()
+        self._settings.opencode_model = oc_model_combo.currentText().strip() or "github-copilot/claude-sonnet-4"
+        self._settings.api_base_url = url_edit.text().strip()
         self._settings.model = model_edit.text().strip() or "gpt-4o"
         self._settings.temperature = float(temp.value())
         self._settings.max_iterations = int(iters.value())
@@ -306,12 +365,20 @@ class _AgentWorker(QThread):
                 log_message=log_ui,
             )
 
-            reply = agent_mod.run_agent(
-                self._tool.session,
-                self._tool._api_messages,
-                self._tool._settings,
-                callbacks,
-            )
+            if self._tool._settings.use_opencode:
+                reply = agent_mod.run_agent_opencode(
+                    self._tool.session,
+                    self._tool._api_messages,
+                    self._tool._settings,
+                    callbacks,
+                )
+            else:
+                reply = agent_mod.run_agent(
+                    self._tool.session,
+                    self._tool._api_messages,
+                    self._tool._settings,
+                    callbacks,
+                )
             self._tool._qt.agent_finished.emit(reply or "")
         except Exception as e:
             self._tool._qt.agent_failed.emit(str(e))
