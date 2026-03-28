@@ -15,6 +15,7 @@ class ChimeraLLMSettings(Settings):
         "api_base_url": "",
         "use_copilot": False,
         "copilot_model": "gpt-4o",
+        "log_to_chimerax": True,
     }
     EXPLICIT_SAVE = {
         "api_key": "",

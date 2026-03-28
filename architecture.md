@@ -81,6 +81,8 @@ Copilot bills per premium request, not per token. To keep the agentic loop witho
 
 This means a single user prompt costs exactly **one premium request** regardless of how many tool-calling rounds the agent takes.
 
+Default HTTP headers for Copilot also include `Copilot-Integration-Id: vscode-chat` (required by the Copilot gateway).
+
 ### Copilot authentication flow
 
 ```
@@ -89,8 +91,10 @@ This means a single user prompt costs exactly **one premium request** regardless
    -> Returns: verification_uri, user_code, device_code
 3. User opens URL in browser and enters code
 4. Plugin polls github.com/login/oauth/access_token until authorized
-5. OAuth token saved to ~/.local/share/opencode/auth.json
-6. Token used as Bearer token for api.githubcopilot.com requests
+5. OAuth access token exchanged for a Copilot JWT via GET api.github.com/copilot_internal/v2/token
+6. OAuth token + Copilot JWT + expiry saved to ~/.local/share/opencode/auth.json
+7. Before each API session, JWT is refreshed automatically when near expiry (using the stored OAuth token)
+8. Copilot JWT used as Bearer token for api.githubcopilot.com requests
 ```
 
 ## Threading model
@@ -98,9 +102,15 @@ This means a single user prompt costs exactly **one premium request** regardless
 ChimeraX's UI runs on the main thread. The LLM agent loop (which blocks on network I/O) runs in a `QThread` (`_AgentWorker`). Communication between the two uses Qt signals with `QueuedConnection`:
 
 - **Worker -> Main**: `append_chat_html`, `command_request`, `session_info_request`, `agent_finished`, `agent_failed`
-- **Main -> Worker**: Callbacks pass results back via `threading.Event` wait/set pairs
+- **Main -> Worker**: Callbacks pass results back via `threading.Event` wait/set pairs (with short polling so cancellation and timeouts are responsive)
 
 This ensures ChimeraX commands (`chimerax.core.commands.run`) always execute on the main thread, which ChimeraX requires.
+
+**Important:** The tool's `delete()` method must **never** call `QThread.wait()` on the GUI thread while the worker might be blocked waiting for a queued callback — that deadlocks ChimeraX. On close, the worker is cancelled and `terminate()` is used if still running.
+
+The conversation transcript `_api_messages` is protected by a `threading.Lock` and updated atomically after each assistant turn.
+
+OpenAI HTTP calls use a bounded timeout (`OPENAI_CLIENT_TIMEOUT` in `agent.py`) so a stuck network cannot hang the worker forever.
 
 ## Settings
 

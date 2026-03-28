@@ -5,9 +5,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Callable, Dict, List, Optional
 
+from chimerallm.settings import get_settings
 from chimerallm.system_prompt import SYSTEM_PROMPT
+
+# HTTP timeout for OpenAI SDK (seconds). Prevents indefinite hangs on bad networks.
+OPENAI_CLIENT_TIMEOUT = 60.0
 
 
 def _log_llm_request(
@@ -22,6 +27,12 @@ def _log_llm_request(
     The agent runs on a worker thread; ChimeraX's logger/GUI is not thread-safe, so we
     marshal logging onto the UI thread via session.ui.thread_safe when in GUI mode.
     """
+    try:
+        if not getattr(get_settings(session), "log_to_chimerax", True):
+            return
+    except Exception:
+        pass
+
     route = "copilot" if via_copilot else "api"
     msg = (
         "ChimeraLLM LLM request: model=%s route=%s request_chars=%d "
@@ -138,12 +149,248 @@ class AgentCallbacks:
         log_message: Callable[[str], None],
         on_assistant_delta: Optional[Callable[[str], None]] = None,
         on_iteration: Optional[Callable[[int], None]] = None,
+        on_streaming_start: Optional[Callable[[], None]] = None,
+        on_streaming_delta: Optional[Callable[[str], None]] = None,
+        on_streaming_end: Optional[Callable[[], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
     ):
         self.execute_chimerax_command = execute_chimerax_command
         self.get_session_info = get_session_info
         self.log_message = log_message
         self.on_assistant_delta = on_assistant_delta
         self.on_iteration = on_iteration
+        self.on_streaming_start = on_streaming_start
+        self.on_streaming_delta = on_streaming_delta
+        self.on_streaming_end = on_streaming_end
+        self.on_status = on_status
+
+
+def _sync_api_messages(api_messages: List[Dict[str, Any]], messages_with_system: List[Dict[str, Any]]) -> None:
+    api_messages[:] = messages_with_system[1:]
+
+
+def _tool_calls_list_from_accumulator(acc: Dict[int, Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Build OpenAI-style tool_calls list from streaming accumulator (sorted by index)."""
+    out: List[Dict[str, Any]] = []
+    for idx in sorted(acc.keys()):
+        t = acc[idx]
+        out.append(
+            {
+                "id": t.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "arguments": t.get("arguments", "") or "{}",
+                },
+            }
+        )
+    return out
+
+
+def _merge_tool_call_delta(acc: Dict[int, Dict[str, str]], delta_tc: Any) -> None:
+    """Merge one streamed tool_calls delta fragment into *acc*."""
+    i = getattr(delta_tc, "index", None)
+    if i is None:
+        return
+    if i not in acc:
+        acc[i] = {"id": "", "name": "", "arguments": ""}
+    tid = getattr(delta_tc, "id", None)
+    if tid:
+        acc[i]["id"] = tid
+    fn = getattr(delta_tc, "function", None)
+    if fn is not None:
+        name = getattr(fn, "name", None)
+        if name:
+            acc[i]["name"] = name
+        args = getattr(fn, "arguments", None)
+        if args:
+            acc[i]["arguments"] += args
+
+
+def _append_tool_results_from_calls(
+    messages: List[Dict[str, Any]],
+    assistant_content: Optional[str],
+    tool_calls: List[Dict[str, Any]],
+    callbacks: AgentCallbacks,
+) -> None:
+    """Append assistant message with tool_calls and execute tools (serializable dict format)."""
+    assistant_msg: Dict[str, Any] = {"role": "assistant", "content": assistant_content}
+    assistant_msg["tool_calls"] = tool_calls
+    messages.append(assistant_msg)
+
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        fname = fn.get("name", "")
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            tid = tc.get("id", "")
+            result = "Error: invalid JSON in tool arguments"
+            messages.append({"role": "tool", "tool_call_id": tid, "content": result})
+            continue
+
+        tid = tc.get("id", "")
+        try:
+            if fname == "execute_chimerax_command":
+                cmd = args.get("command", "")
+                result = callbacks.execute_chimerax_command(cmd)
+            elif fname == "get_session_info":
+                result = callbacks.get_session_info()
+            elif fname == "log_message":
+                callbacks.log_message(args.get("message", ""))
+                result = "Message shown to user."
+            else:
+                result = f"Unknown tool {fname}"
+        except Exception as e:
+            result = f"Error executing tool {fname}: {e}"
+
+        messages.append({"role": "tool", "tool_call_id": tid, "content": result[:8000]})
+
+
+def _stream_chat_completion(
+    client: Any,
+    create_kwargs: Dict[str, Any],
+    *,
+    callbacks: AgentCallbacks,
+    cancelled: Optional[threading.Event],
+) -> tuple[str, Optional[List[Dict[str, Any]]]]:
+    """Run a streaming chat completion; return (assistant_text, tool_calls or None).
+
+    If *tool_calls* is non-empty, *assistant_text* may still contain streamed prefix text.
+    """
+    create_kwargs = dict(create_kwargs)
+    create_kwargs["stream"] = True
+
+    if callbacks.on_status:
+        callbacks.on_status("Thinking...")
+
+    content_parts: List[str] = []
+    tc_acc: Dict[int, Dict[str, str]] = {}
+    started_streaming = False
+
+    stream = client.chat.completions.create(**create_kwargs)
+    for chunk in stream:
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Cancelled by user.")
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+
+        c = getattr(delta, "content", None)
+        if c is not None:
+            if not started_streaming:
+                if callbacks.on_streaming_start:
+                    callbacks.on_streaming_start()
+                started_streaming = True
+            if c and callbacks.on_streaming_delta:
+                callbacks.on_streaming_delta(c)
+            content_parts.append(c)
+
+        for dtc in getattr(delta, "tool_calls", None) or []:
+            _merge_tool_call_delta(tc_acc, dtc)
+
+    if started_streaming and callbacks.on_streaming_end:
+        callbacks.on_streaming_end()
+
+    full_text = "".join(content_parts)
+    tool_list = _tool_calls_list_from_accumulator(tc_acc) if tc_acc else []
+    if tool_list:
+        return full_text, tool_list
+    return full_text, None
+
+
+def _run_agent_loop(
+    session,
+    api_messages: List[Dict[str, Any]],
+    messages_with_system: List[Dict[str, Any]],
+    client: Any,
+    model: str,
+    callbacks: AgentCallbacks,
+    max_iterations: int,
+    *,
+    via_copilot: bool,
+    temperature: Optional[float] = None,
+    cancelled: Optional[threading.Event] = None,
+) -> str:
+    """Shared tool-calling loop for API and Copilot backends."""
+    final_text = ""
+
+    for iteration in range(max_iterations):
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Cancelled by user.")
+
+        if callbacks.on_iteration:
+            callbacks.on_iteration(iteration)
+
+        _log_llm_request(
+            session,
+            model=model,
+            via_copilot=via_copilot,
+            this_call_chars=_messages_context_chars(messages_with_system),
+        )
+
+        create_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages_with_system,
+            "tools": TOOLS,
+            "tool_choice": "auto",
+        }
+        if temperature is not None:
+            create_kwargs["temperature"] = temperature
+        if via_copilot:
+            initiator = "user" if iteration == 0 else "agent"
+            create_kwargs["extra_headers"] = {"x-initiator": initiator}
+
+        assistant_text, tool_calls = _stream_chat_completion(
+            client, create_kwargs, callbacks=callbacks, cancelled=cancelled
+        )
+
+        if not tool_calls:
+            messages_with_system.append({"role": "assistant", "content": assistant_text})
+            _sync_api_messages(api_messages, messages_with_system)
+            return assistant_text or final_text or ""
+
+        _append_tool_results_from_calls(
+            messages_with_system,
+            assistant_text or None,
+            tool_calls,
+            callbacks,
+        )
+
+    if cancelled is not None and cancelled.is_set():
+        raise RuntimeError("Cancelled by user.")
+
+    messages_with_system.append(
+        {
+            "role": "user",
+            "content": "Stop calling tools. Briefly summarize what was done and what may still be needed.",
+        }
+    )
+    _log_llm_request(
+        session,
+        model=model,
+        via_copilot=via_copilot,
+        this_call_chars=_messages_context_chars(messages_with_system),
+    )
+
+    final_kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": messages_with_system,
+    }
+    if temperature is not None:
+        final_kwargs["temperature"] = temperature
+    if via_copilot:
+        final_kwargs["extra_headers"] = {"x-initiator": "agent"}
+
+    text, _tc = _stream_chat_completion(
+        client, final_kwargs, callbacks=callbacks, cancelled=cancelled
+    )
+    messages_with_system.append({"role": "assistant", "content": text})
+    final_text = text
+    _sync_api_messages(api_messages, messages_with_system)
+    return final_text
 
 
 def run_agent(
@@ -151,6 +398,7 @@ def run_agent(
     api_messages: List[Dict[str, Any]],
     settings,
     callbacks: AgentCallbacks,
+    cancelled: Optional[threading.Event] = None,
 ) -> str:
     """
     Run one assistant turn. `api_messages` must already end with the latest user message.
@@ -170,115 +418,32 @@ def run_agent(
     base_url = (getattr(settings, "api_base_url", "") or "").strip()
     if not base_url:
         base_url = "https://openrouter.ai/api/v1"
-    client = OpenAI(api_key=api_key.strip(), base_url=base_url)
+    client = OpenAI(
+        api_key=api_key.strip(),
+        base_url=base_url,
+        timeout=OPENAI_CLIENT_TIMEOUT,
+    )
     model = getattr(settings, "model", "gpt-4o") or "gpt-4o"
     temperature = float(getattr(settings, "temperature", 0.2))
     max_iterations = int(getattr(settings, "max_iterations", 10))
 
-    messages: List[Dict[str, Any]] = [
+    messages_with_system: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         *api_messages,
     ]
 
-    final_text = ""
-
-    for iteration in range(max_iterations):
-        if callbacks.on_iteration:
-            callbacks.on_iteration(iteration)
-
-        _log_llm_request(
-            session,
-            model=model,
-            via_copilot=False,
-            this_call_chars=_messages_context_chars(messages),
-        )
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=temperature,
-        )
-
-        msg = response.choices[0].message
-
-        if msg.content:
-            final_text = msg.content
-            if callbacks.on_assistant_delta:
-                callbacks.on_assistant_delta(msg.content)
-
-        if not msg.tool_calls:
-            messages.append({"role": "assistant", "content": msg.content})
-            _sync_api_messages(api_messages, messages)
-            return msg.content or final_text or ""
-
-        assistant_msg: Dict[str, Any] = {"role": "assistant", "content": msg.content}
-        assistant_msg["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments or "{}",
-                },
-            }
-            for tc in msg.tool_calls
-        ]
-        messages.append(assistant_msg)
-
-        for tc in msg.tool_calls:
-            fname = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                result = "Error: invalid JSON in tool arguments"
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-                continue
-
-            try:
-                if fname == "execute_chimerax_command":
-                    cmd = args.get("command", "")
-                    result = callbacks.execute_chimerax_command(cmd)
-                elif fname == "get_session_info":
-                    result = callbacks.get_session_info()
-                elif fname == "log_message":
-                    callbacks.log_message(args.get("message", ""))
-                    result = "Message shown to user."
-                else:
-                    result = f"Unknown tool {fname}"
-            except Exception as e:
-                result = f"Error executing tool {fname}: {e}"
-
-            messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": result[:8000]}
-            )
-
-    messages.append(
-        {
-            "role": "user",
-            "content": "Stop calling tools. Briefly summarize what was done and what may still be needed.",
-        }
-    )
-    _log_llm_request(
+    return _run_agent_loop(
         session,
-        model=model,
+        api_messages,
+        messages_with_system,
+        client,
+        model,
+        callbacks,
+        max_iterations,
         via_copilot=False,
-        this_call_chars=_messages_context_chars(messages),
-    )
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
         temperature=temperature,
+        cancelled=cancelled,
     )
-    text = response.choices[0].message.content or ""
-    messages.append({"role": "assistant", "content": text})
-    final_text = text
-    _sync_api_messages(api_messages, messages)
-    return final_text
-
-
-def _sync_api_messages(api_messages: List[Dict[str, Any]], messages_with_system: List[Dict[str, Any]]) -> None:
-    api_messages[:] = messages_with_system[1:]
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +454,7 @@ _COPILOT_BASE_URL = "https://api.githubcopilot.com"
 _COPILOT_HEADERS = {
     "User-Agent": "ChimeraLLM/0.1",
     "Openai-Intent": "conversation-edits",
+    "Copilot-Integration-Id": "vscode-chat",
 }
 
 # Fallback list used when models.dev is unreachable.
@@ -301,10 +467,56 @@ _COPILOT_MODELS_FALLBACK: List[str] = [
 ]
 
 
+def fetch_openai_compatible_models(base_url: str, api_key: str) -> List[str]:
+    """List model IDs from ``GET {base}/v1/models`` (OpenAI-compatible providers).
+
+    Uses the same base URL convention as ``OpenAI(base_url=...)`` (path usually ends
+    with ``/v1``). Raises ``RuntimeError`` on HTTP errors or invalid JSON.
+    """
+    import urllib.error
+    import urllib.request
+
+    key = (api_key or "").strip()
+    if not key:
+        raise RuntimeError("API key is required to list models.")
+
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        base = "https://openrouter.ai/api/v1"
+    if not base.endswith("/v1"):
+        base = base + "/v1"
+    url = base + "/models"
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "User-Agent": "ChimeraLLM/0.1",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Models list failed ({e.code}): {body}") from e
+
+    models = data.get("data") or []
+    ids: List[str] = []
+    for m in models:
+        if isinstance(m, dict):
+            mid = m.get("id")
+            if isinstance(mid, str) and mid:
+                ids.append(mid)
+    if not ids:
+        raise RuntimeError("No models returned by the API.")
+    return sorted(ids)
+
+
 def fetch_copilot_models() -> List[str]:
     """Fetch available GitHub Copilot model IDs from the models.dev registry."""
     import urllib.request
-    import urllib.error
 
     try:
         req = urllib.request.Request(
@@ -326,6 +538,7 @@ def run_agent_copilot(
     settings,
     callbacks: AgentCallbacks,
     session_info: str = "",
+    cancelled: Optional[threading.Event] = None,
 ) -> str:
     """Run one assistant turn via the GitHub Copilot API with native tool calling.
 
@@ -344,9 +557,9 @@ def run_agent_copilot(
             "The 'openai' package is required. Reinstall the bundle or: pip install openai"
         ) from e
 
-    from chimerallm.copilot_auth import get_token
+    from chimerallm.copilot_auth import get_copilot_token
 
-    token = get_token()
+    token = get_copilot_token()
     if not token:
         raise RuntimeError(
             "No Copilot token found. Click 'Login with GitHub' in ChimeraLLM Settings."
@@ -356,6 +569,7 @@ def run_agent_copilot(
         api_key=token,
         base_url=_COPILOT_BASE_URL,
         default_headers=_COPILOT_HEADERS,
+        timeout=OPENAI_CLIENT_TIMEOUT,
     )
 
     model = getattr(settings, "copilot_model", "gpt-4o") or "gpt-4o"
@@ -365,107 +579,20 @@ def run_agent_copilot(
     if session_info:
         sys_content += "\n\n## Current session state (auto-provided)\n" + session_info
 
-    messages: List[Dict[str, Any]] = [
+    messages_with_system: List[Dict[str, Any]] = [
         {"role": "system", "content": sys_content},
         *api_messages,
     ]
 
-    final_text = ""
-
-    for iteration in range(max_iterations):
-        if callbacks.on_iteration:
-            callbacks.on_iteration(iteration)
-
-        # First iteration is user-initiated (billed); follow-ups carrying
-        # tool results are agent-initiated (free under Copilot billing).
-        initiator = "user" if iteration == 0 else "agent"
-
-        _log_llm_request(
-            session,
-            model=model,
-            via_copilot=True,
-            this_call_chars=_messages_context_chars(messages),
-        )
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            extra_headers={"x-initiator": initiator},
-        )
-
-        msg = response.choices[0].message
-
-        if msg.content:
-            final_text = msg.content
-            if callbacks.on_assistant_delta:
-                callbacks.on_assistant_delta(msg.content)
-
-        if not msg.tool_calls:
-            messages.append({"role": "assistant", "content": msg.content})
-            _sync_api_messages(api_messages, messages)
-            return msg.content or final_text or ""
-
-        assistant_msg: Dict[str, Any] = {"role": "assistant", "content": msg.content}
-        assistant_msg["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments or "{}",
-                },
-            }
-            for tc in msg.tool_calls
-        ]
-        messages.append(assistant_msg)
-
-        for tc in msg.tool_calls:
-            fname = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                result = "Error: invalid JSON in tool arguments"
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-                continue
-
-            try:
-                if fname == "execute_chimerax_command":
-                    cmd = args.get("command", "")
-                    result = callbacks.execute_chimerax_command(cmd)
-                elif fname == "get_session_info":
-                    result = callbacks.get_session_info()
-                elif fname == "log_message":
-                    callbacks.log_message(args.get("message", ""))
-                    result = "Message shown to user."
-                else:
-                    result = f"Unknown tool {fname}"
-            except Exception as e:
-                result = f"Error executing tool {fname}: {e}"
-
-            messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": result[:8000]}
-            )
-
-    messages.append(
-        {
-            "role": "user",
-            "content": "Stop calling tools. Briefly summarize what was done and what may still be needed.",
-        }
-    )
-    _log_llm_request(
+    return _run_agent_loop(
         session,
-        model=model,
+        api_messages,
+        messages_with_system,
+        client,
+        model,
+        callbacks,
+        max_iterations,
         via_copilot=True,
-        this_call_chars=_messages_context_chars(messages),
+        temperature=None,
+        cancelled=cancelled,
     )
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        extra_headers={"x-initiator": "agent"},
-    )
-    text = response.choices[0].message.content or ""
-    messages.append({"role": "assistant", "content": text})
-    final_text = text
-    _sync_api_messages(api_messages, messages)
-    return final_text
